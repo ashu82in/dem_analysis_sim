@@ -1,1 +1,6 @@
-streamlit pandas plotly openpyxl
+streamlit
+pandas
+numpy
+plotly
+statsmodels
+openpyxl
