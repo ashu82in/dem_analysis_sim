@@ -8,7 +8,7 @@ from statsmodels.tsa.seasonal import seasonal_decompose
 from prophet import Prophet
 from io import BytesIO
 
-st.set_page_config(page_title="Demand Strategy Pro", layout="wide")
+st.set_page_config(page_title="3-Year Demand Strategy Pro", layout="wide")
 
 # --- 1. SIDEBAR: Parameters ---
 with st.sidebar:
@@ -24,14 +24,25 @@ with st.sidebar:
     service_level = st.slider("Service Level (%)", 70.0, 99.9, 95.0) / 100
 
     st.divider()
-    if st.button("✨ Generate Demo Data"):
-        dates = pd.date_range(start="2025-01-01", periods=365, freq='D')
-        # Macro Growth + Yearly Cycle
-        base = np.linspace(100, 300, 365) + (50 * np.sin(2 * np.pi * np.arange(365) / 365))
-        # Lumpy Distributor Orders
-        mask = np.random.random(365) > 0.85
-        demo_demand = np.where(mask, base * 3.5, 0).astype(int)
+    # UPDATED: Generates 3 years of data (1095 days)
+    if st.button("✨ Generate 3 Years of Demo Data"):
+        dates = pd.date_range(start="2023-01-01", periods=1095, freq='D')
+        
+        # 1. Base Linear Growth (The "Stiff" part)
+        growth = np.linspace(50, 250, 1095) 
+        
+        # 2. Yearly Seasonality (Repeating Sine Wave over 365 days)
+        yearly_pattern = 60 * np.sin(2 * np.pi * np.arange(1095) / 365)
+        
+        # 3. Weekly Noise (Distributor "Lumpiness")
+        mask = np.random.random(1095) > 0.88
+        demo_demand = np.where(mask, (growth + yearly_pattern) * 4, 0).astype(int)
+        
+        # Ensure no negatives in raw data
+        demo_demand = np.clip(demo_demand, 0, None)
+        
         st.session_state['df'] = pd.DataFrame({'ds': dates, 'y': demo_demand})
+        st.success("Generated 1,095 days of historical data!")
 
 # --- 2. DATA LOADING ---
 uploaded_file = st.file_uploader("Upload Excel/CSV", type=["csv", "xlsx"])
@@ -48,35 +59,32 @@ if 'df' in st.session_state:
     df = df.sort_values('ds')
 
     # STEP 1: Overlapping Rolling Window
-    # We aggregate first to capture cumulative risk over the lead time
     df['lt_demand'] = df['y'].rolling(window=lead_time).sum().shift(-offset)
     
     analysis_df = df.dropna().copy()
     if user_type == "Distributor":
-        # Remove zeros POST-aggregation so the Trend doesn't collapse
         analysis_df = analysis_df[analysis_df['lt_demand'] > 0]
 
     try:
-        # STEP 2: Prophet Modeling (Clean Macro Focus)
+        # STEP 2: Prophet Modeling (Aggressive Stiffness for 3-Year Projection)
         prophet_df = analysis_df[['ds', 'lt_demand']].rename(columns={'lt_demand': 'y'})
         prophet_df['floor'] = 0
         
-        # We disable weekly seasonality because the 7-day rolling window already absorbs it
         m = Prophet(
             growth='linear', 
-            yearly_seasonality=True, 
+            yearly_seasonality=True, # Critical for 3-year outlook
             weekly_seasonality=False, 
             daily_seasonality=False,
-            changepoint_prior_scale=0.001 # Forces the "Stiff" Trend Line
+            changepoint_prior_scale=0.001 # Keep the trend stiff/straight
         )
         m.fit(prophet_df)
         
-        # Generate 100-day forecast
-        future = m.make_future_dataframe(periods=100)
+        # FORECAST: Projecting another 3 years into the future
+        future = m.make_future_dataframe(periods=1095)
         future['floor'] = 0
         forecast = m.predict(future)
         
-        # Enforce non-negativity
+        # Non-negativity Clipping
         for col in ['yhat', 'yhat_lower', 'yhat_upper', 'trend', 'yearly']:
             if col in forecast.columns:
                 forecast[col] = forecast[col].clip(lower=0)
@@ -84,79 +92,73 @@ if 'df' in st.session_state:
         hist_forecast = forecast[forecast['ds'] <= analysis_df['ds'].max()]
         future_forecast = forecast[forecast['ds'] > analysis_df['ds'].max()].copy()
 
-        # STEP 3: Visual Decomposition (Stiff Trend + Macro Cycles)
-        # Using a 30-day period for statsmodels to capture monthly/macro patterns 
-        # instead of the noisy weekly one.
+        # STEP 3: Visual Decomposition (Macro-Trend focus)
+        # Using 30-day period to hide daily noise
         decomp = seasonal_decompose(analysis_df['lt_demand'], model='additive', period=30)
         analysis_df['residual'] = decomp.resid
         
-        st.subheader(f"🔍 {lead_time}-Day Window Macro Analysis")
+        st.subheader("🔍 Long-Term Macro Decomposition")
         fig_decomp = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.1,
-                                   subplot_titles=("1. Lead Time Demand (Aggregated)", 
-                                                   "2. Macro Trend (Business Growth Direction)", 
-                                                   "3. Planning Uncertainty (Residuals)"))
+                                   subplot_titles=("1. Historical Demand (7-Day Windows)", 
+                                                   "2. Stiff Macro Trend (Business Path)", 
+                                                   "3. Historical Planning Uncertainty"))
         
-        # Row 1: Raw Aggregated
-        fig_decomp.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['lt_demand'], name="Aggregated", line=dict(color='#A0AEC0')), row=1, col=1)
-        # Row 2: STRAIGHT LINE TREND (from Prophet)
-        fig_decomp.add_trace(go.Scatter(x=hist_forecast['ds'], y=hist_forecast['trend'], name="Stiff Trend", line=dict(color='#3182CE', width=3)), row=2, col=1)
-        # Row 3: Residuals
-        fig_decomp.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['residual'], mode='markers', marker=dict(color='#E53E3E', size=4)), row=3, col=1)
+        fig_decomp.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['lt_demand'], name="Aggregated", line=dict(color='#A0AEC0', width=1)), row=1, col=1)
+        fig_decomp.add_trace(go.Scatter(x=hist_forecast['ds'], y=hist_forecast['trend'], name="Trend", line=dict(color='#3182CE', width=3)), row=2, col=1)
+        fig_decomp.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['residual'], mode='markers', marker=dict(color='#E53E3E', size=3)), row=3, col=1)
         
-        fig_decomp.update_layout(height=700, template="plotly_dark", showlegend=False)
+        fig_decomp.update_layout(height=600, template="plotly_dark", showlegend=False)
         st.plotly_chart(fig_decomp, use_container_width=True)
 
-        # STEP 4: 100-Day Forecast & Strategy Zones
+        # STEP 4: 3-Year Strategic Forecast Plot
         st.divider()
-        st.header("🔮 100-Day Business Forecast & Zones")
+        st.header("🔮 3-Year Strategic Growth Forecast")
         
-        f_mean = future_forecast['yhat'].mean()
-        def get_zone(val):
-            if val < f_mean * 0.9: return "Zone 1 (Stable)"
-            elif val < f_mean * 1.1: return "Zone 2 (Mid)"
-            else: return "Zone 3 (High Surge)"
-        future_forecast['Zone'] = future_forecast['yhat'].apply(get_zone)
-
         fig_f = go.Figure()
-        fig_f.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['lt_demand'], name="Actual", line=dict(color="#A0AEC0")))
-        fig_f.add_trace(go.Scatter(x=future_forecast['ds'], y=future_forecast['yhat'], name="Forecast", line=dict(color="#3182CE", width=3)))
+        fig_f.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['lt_demand'], name="History", line=dict(color="#A0AEC0", width=1)))
+        fig_f.add_trace(go.Scatter(x=future_forecast['ds'], y=future_forecast['yhat'], name="3-Year Forecast", line=dict(color="#3182CE", width=2)))
+        
+        # Uncertainty Shading (Confidence Interval)
         fig_f.add_trace(go.Scatter(
             x=future_forecast['ds'].tolist() + future_forecast['ds'].tolist()[::-1],
             y=future_forecast['yhat_upper'].tolist() + future_forecast['yhat_lower'].tolist()[::-1],
-            fill='toself', fillcolor='rgba(49, 130, 206, 0.2)', line=dict(color='rgba(255,255,255,0)'), name="Safety Buffer Range"
+            fill='toself', fillcolor='rgba(49, 130, 206, 0.1)', line=dict(color='rgba(255,255,255,0)'), name="Uncertainty Range"
         ))
-        fig_f.update_layout(template="plotly_dark")
+        
+        # Year Markers
+        for year in range(future_forecast['ds'].dt.year.min(), future_forecast['ds'].dt.year.max() + 1):
+            fig_f.add_vline(x=f"{year}-01-01", line_dash="dot", line_color="gray", opacity=0.3)
+
+        fig_f.update_layout(template="plotly_dark", title="Expected Demand vs Planning Buffer Over 3 Years")
         st.plotly_chart(fig_f, use_container_width=True)
 
-        # STEP 5: Detailed Forecast Table
-        st.subheader("📅 Strategy Breakdown Table")
-        cols_to_show = ['ds', 'yhat', 'trend', 'yhat_lower', 'yhat_upper', 'Zone']
-        if 'yearly' in future_forecast.columns:
-            cols_to_show.insert(3, 'yearly')
+        # STEP 5: Yearly Strategic Breakdown
+        st.subheader("📊 Annual Inventory Impact Summary")
+        future_forecast['Year'] = future_forecast['ds'].dt.year
+        yearly_summary = future_forecast.groupby('Year')['yhat'].agg(['mean', 'max', 'sum']).rename(columns={
+            'mean': 'Avg LT Demand', 'max': 'Peak Single Window', 'sum': 'Total Annual Throughput'
+        })
+        st.table(yearly_summary.style.format(precision=0))
 
-        table_rename = {
-            'ds': 'Date', 'yhat': 'Total Forecast', 'trend': 'Macro Trend (Base)',
-            'yearly': 'Yearly Cycle', 'yhat_lower': 'Floor Risk', 'yhat_upper': 'Peak Risk'
-        }
-        st.dataframe(future_forecast[cols_to_show].rename(columns=table_rename).style.format(precision=0), use_container_width=True)
-
-        # STEP 6: Strategic Metrics
+        # STEP 6: Immediate Metrics
         noise = analysis_df['residual'].dropna()
         safety_buffer = noise.quantile(service_level)
-        
-        # Last Trend Point
         last_trend = hist_forecast['trend'].iloc[-1]
-        total_req = max(0, last_trend + safety_buffer)
+        total_req = last_trend + safety_buffer
 
         st.divider()
         c1, c2 = st.columns(2)
         with c1:
-            st.metric("Total Order Requirement", f"{total_req:.0f} units")
-            st.write(f"Safety Buffer: **{safety_buffer:.1f}**")
-            st.caption("Buffer is calculated on residuals of the 7-day window to mitigate cumulative risk.")
+            st.metric("Immediate Stock Target", f"{total_req:.0f} units")
+            st.write(f"Safety Buffer: **{safety_buffer:.0f}**")
         with c2:
-            st.write("**Zone Summary**")
-            st.table(future_forecast.groupby('Zone')['yhat'].agg(['count', 'mean']).rename(columns={'count':'Days', 'mean':'Avg Demand'}))
+            st.info(f"""
+            **Presentation Insight:**
+            Over the next 3 years, your 'Peak Demand Windows' are forecasted to grow from 
+            **{yearly_summary['Peak Demand Window'].iloc[0]:.0f}** to **{yearly_summary['Peak Demand Window'].iloc[-1]:.0f}**. 
+            
+            The widening blue shade shows that while we can track the trend, the 'leaks' in the tank become harder to predict the further we look.
+            """)
 
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Computation Error: {e}")
