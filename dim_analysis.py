@@ -5,11 +5,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 from io import BytesIO
 
 st.set_page_config(page_title="Demand Intelligence Pro", layout="wide")
 
-# --- 1. SIDEBAR: Strategy & Parameters ---
+# --- 1. SIDEBAR: Parameters ---
 with st.sidebar:
     st.header("🎯 Strategy Settings")
     user_type = st.radio("Business Model", ["Retailer", "Distributor"])
@@ -25,10 +26,11 @@ with st.sidebar:
     st.divider()
     if st.button("✨ Generate Demo Data"):
         dates = pd.date_range(start="2025-01-01", periods=365, freq='D')
-        base = np.linspace(40, 100, 365) + (15 * np.sin(2 * np.pi * np.arange(365) / 7))
-        mask = np.random.random(365) > 0.82
+        # Base with Growth + Weekly Heartbeat
+        base = np.linspace(40, 120, 365) + (15 * np.sin(2 * np.pi * np.arange(365) / 7))
+        # Distributor Lumpy Pattern
+        mask = np.random.random(365) > 0.85
         demo_demand = np.where(mask, base * 4, 0).astype(int)
-        demo_demand[-20:] += np.random.randint(60, 120, 20)
         st.session_state['df'] = pd.DataFrame({'date': dates, 'demand': demo_demand})
 
 # --- 2. DATA LOADING ---
@@ -36,7 +38,7 @@ uploaded_file = st.file_uploader("Upload Excel/CSV", type=["csv", "xlsx"])
 if uploaded_file:
     st.session_state['df'] = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
 
-# --- 3. CORE LOGIC ---
+# --- 3. CORE ANALYSIS & FORECASTING ---
 if 'df' in st.session_state:
     df = st.session_state['df'].copy()
     df.columns = [c.lower().strip() for c in df.columns]
@@ -46,10 +48,11 @@ if 'df' in st.session_state:
     # STEP 1: Rolling Sum (Lead Time Demand)
     df['lt_demand'] = df['demand'].rolling(window=lead_time).sum().shift(-offset)
     
-    # STEP 2: Filter Zeros for Distributor
+    # STEP 2: Filter Zeros for Distributor (POST-Aggregation)
     analysis_df = df.dropna().copy()
     if user_type == "Distributor":
         analysis_df = analysis_df[analysis_df['lt_demand'] > 0]
+        st.caption("✅ Distributor Mode: Zero-demand windows removed.")
 
     # STEP 3: Decomposition
     try:
@@ -58,56 +61,58 @@ if 'df' in st.session_state:
         analysis_df['seasonal'] = decomp.seasonal
         analysis_df['residual'] = decomp.resid
         
-        # --- VISUAL A: 4-Row Decomposition Breakout ---
-        st.subheader("🔍 Demand Decomposition & Raw Data")
+        # --- VISUAL A: 4-Row Decomposition ---
+        st.subheader("🔍 Demand Decomposition Breakout")
+        fig_decomp = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.07,
+                                   subplot_titles=("Raw Lead Time Demand", "Trend (Growth)", "Seasonality (Cycle)", "Residuals (Unpredictable Noise)"))
         
-        # We now use 4 rows to include the Raw Data at the top
-        fig_decomp = make_subplots(
-            rows=4, cols=1, 
-            shared_xaxes=True, 
-            vertical_spacing=0.07,
-            subplot_titles=("1. Raw Lead Time Demand (Aggregated)", "2. Trend (Growth)", "3. Seasonality (Cycle)", "4. Residuals (Unpredictable Noise)")
-        )
-
-        # Row 1: Raw Data
         fig_decomp.add_trace(go.Scatter(x=analysis_df['date'], y=analysis_df['lt_demand'], name="Raw", line=dict(color='#A0AEC0')), row=1, col=1)
-        # Row 2: Trend
         fig_decomp.add_trace(go.Scatter(x=analysis_df['date'], y=analysis_df['trend'], name="Trend", line=dict(color='#3182CE')), row=2, col=1)
-        # Row 3: Seasonality
         fig_decomp.add_trace(go.Scatter(x=analysis_df['date'], y=analysis_df['seasonal'], name="Seasonality", line=dict(color='#805AD5')), row=3, col=1)
-        # Row 4: Residuals
         fig_decomp.add_trace(go.Scatter(x=analysis_df['date'], y=analysis_df['residual'], name="Residuals", mode='markers', marker=dict(color='#E53E3E', size=4)), row=4, col=1)
-        
-        fig_decomp.update_layout(height=800, showlegend=False, template="plotly_dark")
+        fig_decomp.update_layout(height=700, showlegend=False, template="plotly_dark")
         st.plotly_chart(fig_decomp, use_container_width=True)
 
-        # STEP 4: Safety Stock Calculation
-        noise_series = analysis_df['residual'].dropna()
-        safety_buffer = noise_series.quantile(service_level)
-        current_baseline = analysis_df['trend'].iloc[-1] + analysis_df['seasonal'].iloc[-1]
-        total_req = current_baseline + safety_buffer
-
-        # --- VISUAL B: Results ---
+        # STEP 4: SARIMA Forecast (Next 100 Days)
         st.divider()
-        c1, c2 = st.columns([2, 1])
+        st.header("🔮 100-Day SARIMA Forecast & Zones")
+        
+        series = analysis_df.set_index('date')['lt_demand']
+        sarima_model = SARIMAX(series, order=(1,1,1), seasonal_order=(1,1,1,7)).fit(disp=False)
+        forecast_res = sarima_model.get_forecast(steps=100)
+        forecast_df = forecast_res.summary_frame()
+        forecast_df.index = pd.date_range(start=series.index[-1] + pd.Timedelta(days=1), periods=100)
 
-        with c1:
-            st.subheader("📊 Lead Time Uncertainty (Residuals)")
-            fig_hist = px.histogram(noise_series, x=noise_series, nbins=35, title="Safety Stock focused only on 'Noise'")
-            fig_hist.add_vline(x=safety_buffer, line_dash="dash", line_color="#E53E3E")
-            st.plotly_chart(fig_hist, use_container_width=True)
+        # Zoning Logic
+        avg_f = forecast_df['mean'].mean()
+        def get_zone(val):
+            if val < avg_f * 0.85: return "Zone 1 (Low)"
+            elif val < avg_f * 1.15: return "Zone 2 (Normal)"
+            else: return "Zone 3 (Peak)"
+        forecast_df['Zone'] = forecast_df['mean'].apply(get_zone)
 
-        with c2:
-            st.subheader("💡 Strategic Recommendation")
-            st.metric("Total Order Quantity", f"{total_req:.0f} units")
-            st.write(f"**Baseline Demand:** {current_baseline:.0f}")
-            st.write(f"**Safety Buffer:** {safety_buffer:.0f}")
-            
-            output = BytesIO()
-            analysis_df.to_excel(output, index=False)
-            st.download_button("📥 Download Analysis", output.getvalue(), "demand_report.xlsx")
+        # --- VISUAL B: Forecast Chart ---
+        fig_f = go.Figure()
+        fig_f.add_trace(go.Scatter(x=series.index[-30:], y=series[-30:], name="History", line=dict(color="#A0AEC0")))
+        fig_f.add_trace(go.Scatter(x=forecast_df.index, y=forecast_df['mean'], name="Forecast", line=dict(color="#3182CE", width=3)))
+        fig_f.add_trace(go.Scatter(
+            x=forecast_df.index.tolist() + forecast_df.index.tolist()[::-1],
+            y=forecast_df['mean_ci_upper'].tolist() + forecast_df['mean_ci_lower'].tolist()[::-1],
+            fill='toself', fillcolor='rgba(49, 130, 206, 0.2)', line=dict(color='rgba(255,255,255,0)'), name="95% Confidence"
+        ))
+        st.plotly_chart(fig_f, use_container_width=True)
+
+        # STEP 5: Smart Safety Stock (Residuals)
+        noise = analysis_df['residual'].dropna()
+        safety_buffer = noise.quantile(service_level)
+        current_req = (analysis_df['trend'].iloc[-1] + analysis_df['seasonal'].iloc[-1]) + safety_buffer
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Total Order Requirement", f"{current_req:.0f} units")
+            st.write(f"Safety Buffer: {safety_buffer:.1f} units")
+        with col2:
+            st.table(forecast_df.groupby('Zone')['mean'].agg(['count', 'mean', 'max']).rename(columns={'count':'Days', 'mean':'Avg Demand'}))
 
     except Exception as e:
-        st.error(f"Analysis failed: {e}")
-else:
-    st.info("👋 Upload data or click 'Generate Demo Data' to begin.")
+        st.error(f"Computation Error: {e}")
