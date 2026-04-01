@@ -7,7 +7,7 @@ from plotly.subplots import make_subplots
 from statsmodels.tsa.seasonal import seasonal_decompose
 from prophet import Prophet
 
-st.set_page_config(page_title="3-Year Strategy Horizon", layout="wide")
+st.set_page_config(page_title="3-Year Strategic Growth", layout="wide")
 
 # --- 1. SIDEBAR ---
 with st.sidebar:
@@ -41,7 +41,7 @@ if uploaded_file:
     data = data.rename(columns={'date': 'ds', 'demand': 'y'})
     st.session_state['df'] = data
 
-# --- 3. CORE ANALYSIS & FORECASTING ---
+# --- 3. CORE ANALYSIS ---
 if 'df' in st.session_state:
     df = st.session_state['df'].copy()
     df['ds'] = pd.to_datetime(df['ds'])
@@ -54,7 +54,7 @@ if 'df' in st.session_state:
         analysis_df = analysis_df[analysis_df['lt_demand'] > 0]
 
     try:
-        # STEP 2: Prophet Modeling (Pivoting Trend)
+        # STEP 2: Prophet Modeling
         prophet_df = analysis_df[['ds', 'lt_demand']].rename(columns={'lt_demand': 'y'})
         m = Prophet(growth='linear', yearly_seasonality=True, weekly_seasonality=False, 
                     daily_seasonality=False, changepoint_prior_scale=0.05)
@@ -72,40 +72,39 @@ if 'df' in st.session_state:
         hist_forecast = forecast[forecast['ds'] <= analysis_df['ds'].max()].copy()
         future_forecast = forecast[forecast['ds'] > analysis_df['ds'].max()].copy()
 
-        # STEP 3: Decomposition
+        # STEP 3: Visual Breakdown
         decomp = seasonal_decompose(analysis_df['lt_demand'], model='additive', period=365 if len(analysis_df) > 730 else 30)
-        analysis_df['yearly_cycle'] = decomp.seasonal
         analysis_df['residual'] = decomp.resid
 
-        # --- VISUAL BREAKDOWN ---
-        st.subheader("🔍 3-Year Macro Strategy Breakdown")
-        fig_macro = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-                                   subplot_titles=("1. Historical Demand", "2. Piecewise Trend (Path)", 
-                                                   "3. Yearly Cycle (Wave)", "4. Uncertainty (Blind Spots)"))
+        st.subheader("🔍 Macro Strategic Breakdown (History)")
+        fig_macro = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                                   subplot_titles=("1. Historical Aggregated Demand", 
+                                                   "2. Base Trend (Strategic Growth Direction)", 
+                                                   "3. Planning Uncertainty (Blind Spot Noise)"))
 
         fig_macro.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['lt_demand'], name="Raw", line=dict(color='#A0AEC0', width=1)), row=1, col=1)
         fig_macro.add_trace(go.Scatter(x=hist_forecast['ds'], y=hist_forecast['trend'], name="Trend", line=dict(color='#3182CE', width=3)), row=2, col=1)
-        fig_macro.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['yearly_cycle'], name="Seasonality", line=dict(color='#805AD5', width=2)), row=3, col=1)
-        fig_macro.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['residual'], mode='markers', marker=dict(color='#E53E3E', size=3)), row=4, col=1)
-        fig_macro.update_layout(height=800, template="plotly_dark", showlegend=False)
+        fig_macro.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['residual'], mode='markers', marker=dict(color='#E53E3E', size=3)), row=3, col=1)
+        fig_macro.update_layout(height=700, template="plotly_dark", showlegend=False)
         st.plotly_chart(fig_macro, use_container_width=True)
 
-        # --- HISTORICAL DATA TABLE ---
-        with st.expander("📊 View Historical Component Breakdown (Trend & Seasonality)"):
-            hist_table = analysis_df[['ds', 'lt_demand']].copy()
-            # Merge with Prophet trend for accuracy
-            hist_table = hist_table.merge(hist_forecast[['ds', 'trend', 'yearly']], on='ds')
-            hist_table = hist_table.rename(columns={
-                'ds': 'Date', 'lt_demand': 'Actual Demand (Window)', 
-                'trend': 'Base Trend', 'yearly': 'Annual Seasonality'
-            })
-            st.dataframe(hist_table.style.format(precision=0), use_container_width=True)
+        # --- HISTORICAL TABLE (VISIBLE NOW) ---
+        st.subheader("📊 Historical Component Breakdown")
+        hist_table = analysis_df[['ds', 'lt_demand']].copy()
+        hist_table = hist_table.merge(hist_forecast[['ds', 'trend', 'yearly']], on='ds')
+        
+        # Formatting for display
+        hist_display = hist_table.rename(columns={
+            'ds': 'Date', 'lt_demand': 'Aggregated Demand', 
+            'trend': 'Base Trend (Pivoting)', 'yearly': 'Annual Wave'
+        })
+        st.dataframe(hist_display.style.format(precision=0), use_container_width=True)
 
-        # STEP 4: 3-Year Forecast
+        # STEP 4: Forecast Visual
         st.divider()
-        st.header("🔮 3-Year Strategic Growth Forecast")
+        st.header("🔮 3-Year Strategic Horizon Forecast")
         fig_f = go.Figure()
-        fig_f.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['lt_demand'], name="History", line=dict(color="#A0AEC0", width=1)))
+        fig_f.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['lt_demand'], name="Past", line=dict(color="#A0AEC0", width=1)))
         fig_f.add_trace(go.Scatter(x=future_forecast['ds'], y=future_forecast['yhat'], name="Forecast", line=dict(color="#3182CE", width=2)))
         fig_f.add_trace(go.Scatter(
             x=future_forecast['ds'].tolist() + future_forecast['ds'].tolist()[::-1],
@@ -115,14 +114,13 @@ if 'df' in st.session_state:
         fig_f.update_layout(template="plotly_dark")
         st.plotly_chart(fig_f, use_container_width=True)
 
-        # --- FORECAST DATA TABLE ---
-        st.subheader("📅 3-Year Strategic Forecast Breakdown")
-        f_table = future_forecast[['ds', 'yhat', 'trend', 'yearly', 'yhat_upper']].copy()
-        f_table = f_table.rename(columns={
-            'ds': 'Date', 'yhat': 'Total Forecast', 'trend': 'Projected Trend', 
-            'yearly': 'Projected Seasonality', 'yhat_upper': 'Peak Risk'
+        # --- FORECAST TABLE ---
+        st.subheader("📅 3-Year Forecast Breakdown")
+        f_display = future_forecast[['ds', 'yhat', 'trend', 'yearly', 'yhat_upper']].rename(columns={
+            'ds': 'Date', 'yhat': 'Total Expected', 'trend': 'Projected Trend', 
+            'yearly': 'Projected Wave', 'yhat_upper': 'Peak Risk Limit'
         })
-        st.dataframe(f_table.style.format(precision=0), use_container_width=True)
+        st.dataframe(f_display.style.format(precision=0), use_container_width=True)
 
         # STEP 5: Metrics
         noise = analysis_df['residual'].dropna()
@@ -132,10 +130,10 @@ if 'df' in st.session_state:
         st.divider()
         c1, c2 = st.columns(2)
         with c1:
-            st.metric("Immediate Order Target", f"{total_req:.0f} units")
+            st.metric("Current Order Target", f"{total_req:.0f} units")
             st.write(f"Safety Buffer (Blind Spot Protection): **{safety_buffer:.0f}**")
         with c2:
-            st.info("**Strategic Insight:** Use the Historical Table to see how 'Base Trend' and 'Annual Wave' combined to create your past peaks. The Forecast Table uses that same DNA to predict your next 3 years.")
+            st.info("The tables above allow you to see exactly how 'Growth' and 'Waves' combined in the past to create your current situation, and how they will drive your next 3 years.")
 
     except Exception as e:
         st.error(f"Computation Error: {e}")
