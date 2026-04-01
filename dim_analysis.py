@@ -8,7 +8,7 @@ from statsmodels.tsa.seasonal import seasonal_decompose
 from prophet import Prophet
 from io import BytesIO
 
-st.set_page_config(page_title="Demand Intelligence Pro", layout="wide")
+st.set_page_config(page_title="Demand Strategy Pro", layout="wide")
 
 # --- 1. SIDEBAR: Parameters ---
 with st.sidebar:
@@ -26,9 +26,9 @@ with st.sidebar:
     st.divider()
     if st.button("✨ Generate Demo Data"):
         dates = pd.date_range(start="2025-01-01", periods=365, freq='D')
-        # Strong Growth + Weekly Heartbeat
-        base = np.linspace(50, 180, 365) + (20 * np.sin(2 * np.pi * np.arange(365) / 7))
-        # Lumpy Distributor Orders
+        # Macro Growth + Weekly Heartbeat
+        base = np.linspace(60, 200, 365) + (25 * np.sin(2 * np.pi * np.arange(365) / 7))
+        # Distributor Lumpy Orders
         mask = np.random.random(365) > 0.85
         demo_demand = np.where(mask, base * 3.5, 0).astype(int)
         st.session_state['df'] = pd.DataFrame({'ds': dates, 'y': demo_demand})
@@ -41,98 +41,101 @@ if uploaded_file:
     data = data.rename(columns={'date': 'ds', 'demand': 'y'})
     st.session_state['df'] = data
 
-# --- 3. CORE ANALYSIS ---
+# --- 3. CORE ANALYSIS & FORECASTING ---
 if 'df' in st.session_state:
     df = st.session_state['df'].copy()
     df['ds'] = pd.to_datetime(df['ds'])
     df = df.sort_values('ds')
 
-    # STEP 1: Rolling Sum (Windowed Lead Time Demand)
-    # We aggregate first to see the cumulative 7-day risk
+    # STEP 1: Rolling Window Aggregation (Cumulative Risk)
     df['lt_demand'] = df['y'].rolling(window=lead_time).sum().shift(-offset)
     
     analysis_df = df.dropna().copy()
     if user_type == "Distributor":
-        # Remove zeros POST-aggregation so the Trend isn't pulled to zero
+        # Remove zeros POST-aggregation to keep Trend from collapsing
         analysis_df = analysis_df[analysis_df['lt_demand'] > 0]
 
     try:
-        # STEP 2: Decomposition (Capturing Current Uncertainty)
-        # Using a 7-day period to capture weekly cycles
+        # STEP 2: Prophet Modeling (For Straight-Line Trend & Forecast)
+        prophet_df = analysis_df[['ds', 'lt_demand']].rename(columns={'lt_demand': 'y'})
+        prophet_df['floor'] = 0
+        
+        # changepoint_prior_scale=0.001 forces the trend to be a series of straight lines
+        m = Prophet(growth='linear', yearly_seasonality=True, weekly_seasonality=True, 
+                    changepoint_prior_scale=0.001)
+        m.fit(prophet_df)
+        
+        # Get historical trend and 100-day forecast
+        future = m.make_future_dataframe(periods=100)
+        future['floor'] = 0
+        forecast = m.predict(future)
+        
+        # Non-negative Clipping
+        for col in ['yhat', 'yhat_lower', 'yhat_upper', 'trend']:
+            forecast[col] = forecast[col].clip(lower=0)
+            
+        # Split forecast into historical fit and future prediction
+        hist_forecast = forecast[forecast['ds'] <= analysis_df['ds'].max()]
+        future_forecast = forecast[forecast['ds'] > analysis_df['ds'].max()]
+
+        # STEP 3: Visual Decomposition (Using Prophet's Straight Trend)
+        # We still use statsmodels for the Seasonal/Residual breakout
         decomp = seasonal_decompose(analysis_df['lt_demand'], model='additive', period=7)
-        analysis_df['trend_raw'] = decomp.trend
         analysis_df['seasonal'] = decomp.seasonal
         analysis_df['residual'] = decomp.resid
         
-        st.subheader(f"🔍 Lead Time Window ({lead_time}-Day) Analysis")
-        
-        # Breakdown Visuals
+        st.subheader(f"🔍 Lead Time Window ({lead_time}-Day) Decomposition")
         fig_decomp = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.07,
-                                   subplot_titles=("Raw LT Demand", "Trend (Window Volume)", "Seasonality (Weekly Wave)", "Residuals (Unpredictable Noise)"))
+                                   subplot_titles=("Raw Aggregated Demand", "Macro Trend (Business Direction)", 
+                                                   "Seasonality (Weekly Wave)", "Residuals (Unpredictable Noise)"))
         
+        # Row 1: Raw
         fig_decomp.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['lt_demand'], name="Raw", line=dict(color='#A0AEC0')), row=1, col=1)
-        fig_decomp.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['trend_raw'], name="Trend", line=dict(color='#3182CE')), row=2, col=1)
+        # Row 2: STRAIGHT LINE TREND (from Prophet)
+        fig_decomp.add_trace(go.Scatter(x=hist_forecast['ds'], y=hist_forecast['trend'], name="Trend", line=dict(color='#3182CE', width=3)), row=2, col=1)
+        # Row 3: Seasonality
         fig_decomp.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['seasonal'], name="Seasonality", line=dict(color='#805AD5')), row=3, col=1)
+        # Row 4: Residuals
         fig_decomp.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['residual'], name="Residuals", mode='markers', marker=dict(color='#E53E3E', size=4)), row=4, col=1)
-        fig_decomp.update_layout(height=700, template="plotly_dark", showlegend=False)
+        
+        fig_decomp.update_layout(height=800, template="plotly_dark", showlegend=False)
         st.plotly_chart(fig_decomp, use_container_width=True)
 
-        # STEP 3: Prophet Forecasting (Macro Trend & 100-Day Plan)
+        # STEP 4: 100-Day Forecast & Zones
         st.divider()
         st.header("🔮 100-Day Business Forecast & Zones")
         
-        prophet_df = analysis_df[['ds', 'lt_demand']].rename(columns={'lt_demand': 'y'})
-        
-        # m = Prophet with very low changepoint_prior_scale for 'straight' lines
-        m = Prophet(
-            growth='linear', 
-            yearly_seasonality=True, 
-            weekly_seasonality=True, 
-            changepoint_prior_scale=0.005 # Low flexibility = Smooth macro trend
-        )
-        m.fit(prophet_df)
-        
-        future = m.make_future_dataframe(periods=100)
-        forecast = m.predict(future)
-        
-        # Enforce non-negativity (Clip at 0)
-        for col in ['yhat', 'yhat_lower', 'yhat_upper']:
-            forecast[col] = forecast[col].clip(lower=0)
-            
-        f_part = forecast.tail(100).copy()
-
-        # Dynamic Zones
-        f_mean = f_part['yhat'].mean()
+        # Zoning Logic
+        f_mean = future_forecast['yhat'].mean()
         def get_zone(val):
             if val < f_mean * 0.9: return "Zone 1 (Stable)"
             elif val < f_mean * 1.1: return "Zone 2 (Mid)"
             else: return "Zone 3 (High Surge)"
-        f_part['Zone'] = f_part['yhat'].apply(get_zone)
+        future_forecast['Zone'] = future_forecast['yhat'].apply(get_zone)
 
-        # Visual: Forecast
         fig_f = go.Figure()
-        fig_f.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['lt_demand'], name="Actual", line=dict(color="#A0AEC0")))
-        fig_f.add_trace(go.Scatter(x=f_part['ds'], y=f_part['yhat'], name="Forecast", line=dict(color="#3182CE", width=3)))
+        fig_f.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['lt_demand'], name="History", line=dict(color="#A0AEC0")))
+        fig_f.add_trace(go.Scatter(x=future_forecast['ds'], y=future_forecast['yhat'], name="Forecast", line=dict(color="#3182CE", width=3)))
         fig_f.add_trace(go.Scatter(
-            x=f_part['ds'].tolist() + f_part['ds'].tolist()[::-1],
-            y=f_part['yhat_upper'].tolist() + f_part['yhat_lower'].tolist()[::-1],
-            fill='toself', fillcolor='rgba(49, 130, 206, 0.15)', line=dict(color='rgba(255,255,255,0)'), name="Risk Range"
+            x=future_forecast['ds'].tolist() + future_forecast['ds'].tolist()[::-1],
+            y=future_forecast['yhat_upper'].tolist() + future_forecast['yhat_lower'].tolist()[::-1],
+            fill='toself', fillcolor='rgba(49, 130, 206, 0.2)', line=dict(color='rgba(255,255,255,0)'), name="Risk Range"
         ))
         fig_f.update_layout(template="plotly_dark", title="Future Windowed Demand Forecast")
         st.plotly_chart(fig_f, use_container_width=True)
 
-        # STEP 4: Strategic Table & Metrics
+        # STEP 5: Detailed Forecast Table
         st.subheader("📅 Detailed Strategy Table")
-        st.dataframe(f_part[['ds', 'yhat', 'yhat_lower', 'yhat_upper', 'Zone']].rename(columns={
+        st.dataframe(future_forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper', 'Zone']].rename(columns={
             'ds':'Date', 'yhat':'Expected Demand', 'yhat_lower':'Lower Risk', 'yhat_upper':'Upper Risk'
         }).style.format(precision=0), use_container_width=True)
 
-        # Safety Stock calculation from Decomposition Residuals
+        # STEP 6: Safety Stock calculation from Residuals
         noise = analysis_df['residual'].dropna()
         safety_buffer = noise.quantile(service_level)
         
-        # Baseline = Current Trend + Seasonal effect
-        last_trend = analysis_df['trend_raw'].dropna().iloc[-1]
+        # Baseline = Last Stiff Trend + Last Seasonal point
+        last_trend = hist_forecast['trend'].iloc[-1]
         last_seasonal = analysis_df['seasonal'].dropna().iloc[-1]
         total_req = max(0, last_trend + last_seasonal + safety_buffer)
 
@@ -141,10 +144,10 @@ if 'df' in st.session_state:
         with c1:
             st.metric("Total Order Requirement", f"{total_req:.0f} units")
             st.write(f"Safety Buffer: **{safety_buffer:.1f}**")
-            st.caption("Buffer covers the 'Window Residuals' (Uncertainty).")
+            st.caption("Buffer is calculated purely on 'Window Residuals' to cover the blind spots.")
         with c2:
             st.write("**Future Zone Analysis**")
-            st.table(f_part.groupby('Zone')['yhat'].agg(['count', 'mean']).rename(columns={'count':'Days', 'mean':'Avg Demand'}))
+            st.table(future_forecast.groupby('Zone')['yhat'].agg(['count', 'mean']).rename(columns={'count':'Days', 'mean':'Avg Demand'}))
 
     except Exception as e:
         st.error(f"Computation Error: {e}")
