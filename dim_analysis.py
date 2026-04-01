@@ -5,7 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from statsmodels.tsa.seasonal import seasonal_decompose
-from statsmodels.tsa.statespace.sarimax import SARIMAX
+from prophet import Prophet
 from io import BytesIO
 
 st.set_page_config(page_title="Demand Intelligence Pro", layout="wide")
@@ -26,93 +26,105 @@ with st.sidebar:
     st.divider()
     if st.button("✨ Generate Demo Data"):
         dates = pd.date_range(start="2025-01-01", periods=365, freq='D')
-        # Base with Growth + Weekly Heartbeat
-        base = np.linspace(40, 120, 365) + (15 * np.sin(2 * np.pi * np.arange(365) / 7))
-        # Distributor Lumpy Pattern
+        base = np.linspace(40, 150, 365) + (20 * np.sin(2 * np.pi * np.arange(365) / 7))
         mask = np.random.random(365) > 0.85
-        demo_demand = np.where(mask, base * 4, 0).astype(int)
-        st.session_state['df'] = pd.DataFrame({'date': dates, 'demand': demo_demand})
+        demo_demand = np.where(mask, base * 3, 0).astype(int)
+        st.session_state['df'] = pd.DataFrame({'ds': dates, 'y': demo_demand})
 
 # --- 2. DATA LOADING ---
 uploaded_file = st.file_uploader("Upload Excel/CSV", type=["csv", "xlsx"])
 if uploaded_file:
-    st.session_state['df'] = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
+    data = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
+    data.columns = [c.lower().strip() for c in data.columns]
+    # Prophet requires columns 'ds' and 'y'
+    data = data.rename(columns={'date': 'ds', 'demand': 'y'})
+    st.session_state['df'] = data
 
-# --- 3. CORE ANALYSIS & FORECASTING ---
+# --- 3. CORE ANALYSIS ---
 if 'df' in st.session_state:
     df = st.session_state['df'].copy()
-    df.columns = [c.lower().strip() for c in df.columns]
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values('date')
+    df['ds'] = pd.to_datetime(df['ds'])
+    df = df.sort_values('ds')
 
     # STEP 1: Rolling Sum (Lead Time Demand)
-    df['lt_demand'] = df['demand'].rolling(window=lead_time).sum().shift(-offset)
+    df['lt_demand'] = df['y'].rolling(window=lead_time).sum().shift(-offset)
     
     # STEP 2: Filter Zeros for Distributor (POST-Aggregation)
     analysis_df = df.dropna().copy()
     if user_type == "Distributor":
         analysis_df = analysis_df[analysis_df['lt_demand'] > 0]
-        st.caption("✅ Distributor Mode: Zero-demand windows removed.")
 
-    # STEP 3: Decomposition
+    # STEP 3: Decomposition Visuals
     try:
         decomp = seasonal_decompose(analysis_df['lt_demand'], model='additive', period=7)
         analysis_df['trend'] = decomp.trend
         analysis_df['seasonal'] = decomp.seasonal
         analysis_df['residual'] = decomp.resid
         
-        # --- VISUAL A: 4-Row Decomposition ---
         st.subheader("🔍 Demand Decomposition Breakout")
         fig_decomp = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.07,
-                                   subplot_titles=("Raw Lead Time Demand", "Trend (Growth)", "Seasonality (Cycle)", "Residuals (Unpredictable Noise)"))
+                                   subplot_titles=("Raw Lead Time Demand", "Trend (Growth)", "Seasonality (Weekly Cycle)", "Residuals (Unpredictable Noise)"))
         
-        fig_decomp.add_trace(go.Scatter(x=analysis_df['date'], y=analysis_df['lt_demand'], name="Raw", line=dict(color='#A0AEC0')), row=1, col=1)
-        fig_decomp.add_trace(go.Scatter(x=analysis_df['date'], y=analysis_df['trend'], name="Trend", line=dict(color='#3182CE')), row=2, col=1)
-        fig_decomp.add_trace(go.Scatter(x=analysis_df['date'], y=analysis_df['seasonal'], name="Seasonality", line=dict(color='#805AD5')), row=3, col=1)
-        fig_decomp.add_trace(go.Scatter(x=analysis_df['date'], y=analysis_df['residual'], name="Residuals", mode='markers', marker=dict(color='#E53E3E', size=4)), row=4, col=1)
+        fig_decomp.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['lt_demand'], name="Raw", line=dict(color='#A0AEC0')), row=1, col=1)
+        fig_decomp.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['trend'], name="Trend", line=dict(color='#3182CE')), row=2, col=1)
+        fig_decomp.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['seasonal'], name="Seasonality", line=dict(color='#805AD5')), row=3, col=1)
+        fig_decomp.add_trace(go.Scatter(x=analysis_df['ds'], y=analysis_df['residual'], name="Residuals", mode='markers', marker=dict(color='#E53E3E', size=4)), row=4, col=1)
         fig_decomp.update_layout(height=700, showlegend=False, template="plotly_dark")
         st.plotly_chart(fig_decomp, use_container_width=True)
 
-        # STEP 4: SARIMA Forecast (Next 100 Days)
+        # STEP 4: Prophet Forecasting (Next 100 Days)
         st.divider()
-        st.header("🔮 100-Day SARIMA Forecast & Zones")
+        st.header("🔮 100-Day Prophet Forecast")
         
-        series = analysis_df.set_index('date')['lt_demand']
-        sarima_model = SARIMAX(series, order=(1,1,1), seasonal_order=(1,1,1,7)).fit(disp=False)
-        forecast_res = sarima_model.get_forecast(steps=100)
-        forecast_df = forecast_res.summary_frame()
-        forecast_df.index = pd.date_range(start=series.index[-1] + pd.Timedelta(days=1), periods=100)
-
-        # Zoning Logic
-        avg_f = forecast_df['mean'].mean()
-        def get_zone(val):
-            if val < avg_f * 0.85: return "Zone 1 (Low)"
-            elif val < avg_f * 1.15: return "Zone 2 (Normal)"
-            else: return "Zone 3 (Peak)"
-        forecast_df['Zone'] = forecast_df['mean'].apply(get_zone)
-
-        # --- VISUAL B: Forecast Chart ---
+        # Prepare data for Prophet
+        prophet_df = analysis_df[['ds', 'lt_demand']].rename(columns={'lt_demand': 'y'})
+        
+        m = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
+        m.fit(prophet_df)
+        
+        future = m.make_future_dataframe(periods=100)
+        forecast = m.predict(future)
+        
+        # --- Visual: Forecast Plot ---
         fig_f = go.Figure()
-        fig_f.add_trace(go.Scatter(x=series.index[-30:], y=series[-30:], name="History", line=dict(color="#A0AEC0")))
-        fig_f.add_trace(go.Scatter(x=forecast_df.index, y=forecast_df['mean'], name="Forecast", line=dict(color="#3182CE", width=3)))
+        # History
+        fig_f.add_trace(go.Scatter(x=prophet_df['ds'], y=prophet_df['y'], name="Actual", line=dict(color="#A0AEC0")))
+        # Forecast
+        f_part = forecast.tail(100)
+        fig_f.add_trace(go.Scatter(x=f_part['ds'], y=f_part['yhat'], name="Prophet Forecast", line=dict(color="#3182CE", width=3)))
+        # Confidence Interval
         fig_f.add_trace(go.Scatter(
-            x=forecast_df.index.tolist() + forecast_df.index.tolist()[::-1],
-            y=forecast_df['mean_ci_upper'].tolist() + forecast_df['mean_ci_lower'].tolist()[::-1],
-            fill='toself', fillcolor='rgba(49, 130, 206, 0.2)', line=dict(color='rgba(255,255,255,0)'), name="95% Confidence"
+            x=f_part['ds'].tolist() + f_part['ds'].tolist()[::-1],
+            y=f_part['yhat_upper'].tolist() + f_part['yhat_lower'].tolist()[::-1],
+            fill='toself', fillcolor='rgba(49, 130, 206, 0.2)', line=dict(color='rgba(255,255,255,0)'), name="Uncertainty Range"
         ))
+        fig_f.update_layout(template="plotly_dark")
         st.plotly_chart(fig_f, use_container_width=True)
 
-        # STEP 5: Smart Safety Stock (Residuals)
+        # STEP 5: Smart Safety Stock & Zoning
         noise = analysis_df['residual'].dropna()
         safety_buffer = noise.quantile(service_level)
-        current_req = (analysis_df['trend'].iloc[-1] + analysis_df['seasonal'].iloc[-1]) + safety_buffer
+        
+        # Baseline = Last Trend + Last Seasonal point
+        last_trend = analysis_df['trend'].dropna().iloc[-1]
+        last_seasonal = analysis_df['seasonal'].dropna().iloc[-1]
+        total_req = last_trend + last_seasonal + safety_buffer
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Total Order Requirement", f"{current_req:.0f} units")
-            st.write(f"Safety Buffer: {safety_buffer:.1f} units")
-        with col2:
-            st.table(forecast_df.groupby('Zone')['mean'].agg(['count', 'mean', 'max']).rename(columns={'count':'Days', 'mean':'Avg Demand'}))
+        # Zoning based on forecasted 'yhat'
+        avg_f = f_part['yhat'].mean()
+        def get_zone(val):
+            if val < avg_f * 0.9: return "Zone 1 (Stable)"
+            elif val < avg_f * 1.1: return "Zone 2 (Mid)"
+            else: return "Zone 3 (High Surge)"
+        f_part['Zone'] = f_part['yhat'].apply(get_zone)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Total Requirement", f"{total_req:.0f} units")
+            st.write(f"**Safety Buffer:** {safety_buffer:.1f} (Risk Mitigation)")
+        with c2:
+            st.write("**Forecasted Zones**")
+            st.dataframe(f_part.groupby('Zone')['yhat'].agg(['count', 'mean', 'max']).rename(columns={'count':'Days'}))
 
     except Exception as e:
-        st.error(f"Computation Error: {e}")
+        st.error(f"Analysis failed: {e}")
